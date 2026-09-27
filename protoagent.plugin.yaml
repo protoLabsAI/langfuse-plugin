@@ -2,7 +2,7 @@
 # without importing the plugin's code.
 id: langfuse
 name: Langfuse (traces, prompts, datasets, evals)
-version: 0.1.0
+version: 0.1.1
 description: >-
   Langfuse's official agent skill (github.com/langfuse/skills, MIT) plus native tools
   for Langfuse data: list and inspect traces (with an observation tree that flags

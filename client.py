@@ -53,6 +53,13 @@ def _check_path(path: str) -> None:
         raise LangfuseError(f"path must be a plain /api/public/ path with no '..', query or fragment (got {path!r})")
 
 
+_QUERY_TIMEOUT_RETRIES = 2
+
+
+def _is_query_timeout(resp: httpx.Response) -> bool:
+    return resp.status_code == 422 and "timed out" in resp.text.lower()
+
+
 def _display(host: str) -> str:
     """A host safe to put in an error message (no userinfo)."""
     return re.sub(r"//[^/@]*@", "//", host)
@@ -157,7 +164,14 @@ class LangfuseClient:
                 timeout=timeout,
                 transport=self._transport,
             ) as http:
-                resp = http.request(method.upper(), path, params=clean_params, json=body)
+                for attempt in range(_QUERY_TIMEOUT_RETRIES + 1):
+                    resp = http.request(method.upper(), path, params=clean_params, json=body)
+                    # Langfuse's legacy read endpoints answer an intermittent ClickHouse
+                    # query timeout with 422 "Request timed out"; the same call usually
+                    # succeeds a moment later. Reads only: a write is never replayed.
+                    if not (method.upper() == "GET" and _is_query_timeout(resp)) or attempt == _QUERY_TIMEOUT_RETRIES:
+                        break
+                    time.sleep(1.0 + attempt)
         except httpx.HTTPError as exc:
             raise LangfuseError(f"could not reach Langfuse at {_display(creds.host)}: {type(exc).__name__}") from exc
         if resp.status_code == 401:
