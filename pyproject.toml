@@ -1,0 +1,15 @@
+# Tooling config only — the plugin is loaded by protoAgent from the manifest, not installed.
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["vendor"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+# Pinned so a contributor's user-level ruff config can't make local and CI disagree.
+select = ["E", "F", "W", "I", "UP", "B", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["langfuse_plugin", "conftest"]
