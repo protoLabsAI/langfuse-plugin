@@ -140,6 +140,33 @@ def observation_tree(observations: list[dict], max_nodes: int) -> dict:
     }
 
 
+def _trace_from_observations(client: LangfuseClient, trace_id: str, max_nodes: int) -> dict:
+    """A trace rebuilt from ``/observations?traceId=`` pages: its tree, with the root
+    observation standing in for the trace's summary fields (name, IO, timing)."""
+    observations: list[dict] = []
+    page = 1
+    while len(observations) < max_nodes:
+        data = client.get("/api/public/observations", traceId=trace_id, limit=100, page=page)
+        batch = data.get("data") or []
+        observations += batch
+        if len(batch) < 100 or page >= ((data.get("meta") or {}).get("totalPages") or page):
+            break
+        page += 1
+    roots = [o for o in observations if not o.get("parentObservationId")]
+    root = min(roots, key=lambda o: o.get("startTime") or "") if roots else {}
+    return {
+        "id": trace_id,
+        "name": root.get("name"),
+        "timestamp": root.get("startTime"),
+        "latency": root.get("latency"),
+        "input": root.get("input"),
+        "output": root.get("output"),
+        "observations": observations,
+        "scores": [],
+        "note": "rebuilt from the observations endpoint (the trace endpoint timed out); scores omitted",
+    }
+
+
 def _search_results(payload: dict) -> list[dict]:
     """Normalise a ``/api/search-docs`` reply. ``answer`` is a JSON string holding either a
     list of documents (the shape the skill documents) or ``{"content": [documents]}`` (the
@@ -216,7 +243,14 @@ def build_tools(
         was never exported, or a run still in flight (a span is exported when it ends).
         """
         try:
-            t = client.get(f"/api/public/traces/{seg(trace_id)}")
+            try:
+                t = client.get(f"/api/public/traces/{seg(trace_id)}")
+            except LangfuseError as exc:
+                if "422" not in str(exc):
+                    raise
+                # The legacy trace endpoint can keep timing out on a big trace; the
+                # observations endpoint pages the same tree without the heavy join.
+                t = _trace_from_observations(client, trace_id, _limit(max_observations, 150, ceiling=1000))
             summary = _trace_summary(t, io_chars if include_io else 0, host())
             if not include_io:
                 summary.pop("input", None)
@@ -226,6 +260,8 @@ def build_tools(
                 {k: s.get(k) for k in ("name", "value", "stringValue", "source", "comment") if s.get(k) is not None}
                 for s in t.get("scores") or []
             ]
+            if t.get("note"):
+                summary["note"] = t["note"]
             return _dump({**summary, "scores": scores, **tree})
         except Exception as exc:  # never raise into the turn
             return _error(exc)

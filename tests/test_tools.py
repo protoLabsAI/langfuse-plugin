@@ -245,3 +245,58 @@ def test_request_shapes_for_the_remaining_reads(fake):
     out = json.loads(t["langfuse_metrics"].invoke({"days": 3, "trace_name": "chat"}))
     p = dict(fake.requests[-1].url.params)
     assert out["days"] == [{"date": "2026-09-27"}] and p["traceName"] == "chat" and p["limit"] == "3"
+
+
+def test_a_legacy_query_timeout_is_retried(fake, monkeypatch):
+    import langfuse_plugin.client as client_mod
+
+    monkeypatch.setattr(client_mod.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+    original = fake.handler
+
+    def flaky(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            import httpx
+
+            return httpx.Response(
+                422, json={"message": "Your query could not be completed", "error": "Request timed out"}
+            )
+        return original(request)
+
+    fake.handler = flaky
+    fake.on("GET", "/api/public/traces", {"data": [], "meta": {"totalItems": 0}})
+    out = json.loads(_tools(fake)["langfuse_traces"].invoke({}))
+    assert out["total"] == 0 and calls["n"] == 2
+
+
+def test_a_trace_that_keeps_timing_out_is_rebuilt_from_observations(fake, monkeypatch):
+    import langfuse_plugin.client as client_mod
+
+    monkeypatch.setattr(client_mod.time, "sleep", lambda s: None)
+    fake.on("GET", "/api/public/traces/t1", {"message": "x", "error": "Request timed out"}, status=422)
+    fake.on(
+        "GET",
+        "/api/public/observations",
+        {
+            "data": [
+                {"id": "r", "type": "SPAN", "name": "workflow:review", "startTime": "1", "output": "PASS"},
+                {"id": "c", "type": "AGENT", "name": "subagent:finder", "parentObservationId": "r", "startTime": "2"},
+            ],
+            "meta": {"totalPages": 1},
+        },
+    )
+    out = json.loads(_tools(fake)["langfuse_trace"].invoke({"trace_id": "t1"}))
+
+    assert out["name"] == "workflow:review" and out["output"] == "PASS"
+    assert out["roots"] == 1 and out["orphans"] == 0 and "rebuilt" in out["note"]
+    assert dict(fake.requests[-1].url.params)["traceId"] == "t1"
+
+
+def test_writes_are_never_replayed_on_a_timeout(fake, monkeypatch):
+    import langfuse_plugin.client as client_mod
+
+    monkeypatch.setattr(client_mod.time, "sleep", lambda s: None)
+    fake.on("POST", "/api/public/scores", {"error": "Request timed out"}, status=422)
+    _tools(fake, allow_writes=True)["langfuse_score"].invoke({"trace_id": "t", "name": "q", "value": 1})
+    assert len([r for r in fake.requests if r.method == "POST"]) == 1
