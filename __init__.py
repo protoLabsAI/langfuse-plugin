@@ -29,4 +29,5 @@ def register(registry) -> None:
     except Exception:
         log.exception("[langfuse] registering skills failed")
 
-    log.info("[langfuse] registered (writes %s)", "enabled" if cfg.get("allow_writes") else "disabled")
+    writes = str(cfg.get("allow_writes")).strip().lower() in ("1", "true", "yes", "on")
+    log.info("[langfuse] registered (writes %s)", "enabled" if writes else "disabled")

@@ -58,3 +58,15 @@ def test_401_names_the_credential_source(fake):
     fake.on("GET", "/api/public/traces", {"message": "no"}, status=401)
     with pytest.raises(LangfuseError, match=r"401.*plugin"):
         LangfuseClient(CFG, transport=fake.transport).get("/api/public/traces")
+
+
+def test_an_unreachable_host_error_carries_no_userinfo(fake):
+    import httpx
+
+    def boom(request):
+        raise httpx.ConnectError("refused")
+
+    cfg = {**CFG, "host": "https://user:hunter2@lf.example"}
+    with pytest.raises(LangfuseError) as err:
+        LangfuseClient(cfg, transport=httpx.MockTransport(boom)).get("/api/public/traces")
+    assert "hunter2" not in str(err.value) and "lf.example" in str(err.value)

@@ -108,7 +108,10 @@ def compose(upstream: str) -> str:
         raise ValueError("upstream SKILL.md has no leading frontmatter block")
     body = parts[2].lstrip("\n")
 
-    # Core principle 2 names the CLI; point it at the tools.
+    # Core principle 2 names the CLI; point it at the tools. Fail loudly if upstream
+    # reworded it: a silent no-op would leave the CLI instruction in the composed skill.
+    if "2. **CLI for Data Access**" not in body:
+        raise ValueError("upstream reworded core principle 2 — update the overlay in compose()")
     body = body.replace(
         "2. **CLI for Data Access**: Use `langfuse-cli` when querying/modifying Langfuse data. "
         "See the section below on how to use the CLI.",

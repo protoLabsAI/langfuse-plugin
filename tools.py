@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 from langchain_core.tools import tool
 
-from .client import USER_AGENT, LangfuseClient, LangfuseError
+from .client import USER_AGENT, LangfuseClient, LangfuseError, seg
 
 REFERENCES_DIR = Path(__file__).resolve().parent / "skills" / "langfuse" / "references"
 DOCS_HOST = "https://langfuse.com"
@@ -42,6 +42,14 @@ def _limit(value: int | None, default: int, ceiling: int = 100) -> int:
         return max(1, min(int(value or default), ceiling))
     except (TypeError, ValueError):
         return default
+
+
+def truthy(value: Any) -> bool:
+    """A config flag parsed strictly: a hand-edited ``allow_writes: "false"`` is a
+    non-empty string, and ``bool()`` would read it as on."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 def _dump(obj: Any) -> str:
@@ -155,7 +163,7 @@ def build_tools(
     """The read tools, plus the write tools when ``allow_writes`` is on."""
     client = LangfuseClient(cfg, host_config, transport=transport)
     io_chars = _limit(cfg.get("max_io_chars"), 1500, ceiling=20_000)
-    allow_writes = bool(cfg.get("allow_writes"))
+    allow_writes = truthy(cfg.get("allow_writes"))
 
     def host() -> str:
         return client.credentials().host
@@ -208,7 +216,7 @@ def build_tools(
         was never exported, or a run still in flight (a span is exported when it ends).
         """
         try:
-            t = client.get(f"/api/public/traces/{trace_id}")
+            t = client.get(f"/api/public/traces/{seg(trace_id)}")
             summary = _trace_summary(t, io_chars if include_io else 0, host())
             if not include_io:
                 summary.pop("input", None)
@@ -270,7 +278,7 @@ def build_tools(
         session's traces in order with their capped input/output."""
         try:
             if session_id:
-                s = client.get(f"/api/public/sessions/{session_id}")
+                s = client.get(f"/api/public/sessions/{seg(session_id)}")
                 base = host()
                 traces = sorted(s.get("traces") or [], key=lambda t: t.get("timestamp") or "")
                 return _dump(
@@ -304,12 +312,15 @@ def build_tools(
                 "fromTimestamp": _since(since_hours),
                 "limit": _limit(limit, 30),
             }
-            try:
-                data = client.get("/api/public/v2/scores", **params)
-            except LangfuseError as exc:
-                if "404" not in str(exc):
-                    raise
-                data = client.get("/api/public/scores", **params)  # older servers
+            data = None
+            # v3 is the endpoint that survives Langfuse v4; v2 and v1 serve older servers.
+            for path in ("/api/public/v3/scores", "/api/public/v2/scores", "/api/public/scores"):
+                try:
+                    data = client.get(path, **params)
+                    break
+                except LangfuseError as exc:
+                    if "404" not in str(exc) or path == "/api/public/scores":
+                        raise
             keep = ("id", "traceId", "observationId", "name", "value", "stringValue", "dataType", "source", "comment")
             return _dump(
                 {
@@ -328,7 +339,7 @@ def build_tools(
         try:
             if name:
                 p = client.get(
-                    f"/api/public/v2/prompts/{name}",
+                    f"/api/public/v2/prompts/{seg(name)}",
                     label=label if not version else "",
                     version=version or None,
                 )
@@ -394,10 +405,13 @@ def build_tools(
         langfuse_docs). GET is always allowed; POST/PATCH/PUT/DELETE only when the plugin's
         allow_writes setting is on. The response is returned as JSON, capped.
         """
-        if method.upper() != "GET" and not allow_writes:
+        verb = (method or "").strip().upper()
+        if verb not in ("GET", "POST", "PATCH", "PUT", "DELETE"):
+            return _dump({"error": f"unsupported method {method!r}"})
+        if verb != "GET" and not allow_writes:
             return _dump({"error": "writes are disabled — the operator must set langfuse.allow_writes: true"})
         try:
-            data = client.request(method, path, params=params, body=body)
+            data = client.request(verb, path, params=params, body=body)
             return _cap(_dump(data), max(io_chars * 8, 8000))
         except Exception as exc:  # never raise into the turn
             return _error(exc)
@@ -413,7 +427,7 @@ def build_tools(
         try:
             with httpx.Client(timeout=20.0, headers={"User-Agent": USER_AGENT}, transport=transport) as http:
                 if page:
-                    path = re.sub(r"^https?://(www\.)?langfuse\.com", "", page.strip()).strip("/")
+                    path = re.sub(r"^https?://(www\.)?langfuse\.com", "", page.strip(), flags=re.IGNORECASE).strip("/")
                     if "://" in path:
                         return _dump({"error": "page must be a langfuse.com path or URL"})
                     path = path[:-3] if path.endswith(".md") else path
@@ -430,8 +444,8 @@ def build_tools(
                 except Exception:  # an unexpected shape: fall through to the raw (capped) text
                     pass
             return _cap(resp.text, _MAX_DOC_CHARS)
-        except httpx.HTTPError as exc:
-            return _dump({"error": f"could not reach langfuse.com: {type(exc).__name__}"})
+        except Exception as exc:  # never raise into the turn (a bad page can be an InvalidURL)
+            return _dump({"error": f"could not read langfuse.com: {type(exc).__name__}"})
 
     @tool
     def langfuse_reference(name: str = "") -> str:
@@ -480,13 +494,19 @@ def _write_tools(client: LangfuseClient) -> list:
         """Attach a score to a Langfuse trace (or one of its observations): an evaluation
         result, a label, or feedback. value is a number, or a string for CATEGORICAL.
         data_type is NUMERIC | CATEGORICAL | BOOLEAN (inferred when empty)."""
+        kind = data_type.strip().upper()
+        if isinstance(value, str) and kind != "CATEGORICAL":
+            try:
+                value = float(value)  # "0.9" from a model is a number, not a category
+            except ValueError:
+                pass
         body = {
             "traceId": trace_id,
             "observationId": observation_id or None,
             "name": name,
             "value": value,
             "comment": comment or None,
-            "dataType": data_type.upper() or None,
+            "dataType": kind or None,
         }
         try:
             return _dump(client.post("/api/public/scores", {k: v for k, v in body.items() if v is not None}))
@@ -496,8 +516,8 @@ def _write_tools(client: LangfuseClient) -> list:
     @tool
     def langfuse_dataset_item(
         dataset_name: str,
-        input: Any,
-        expected_output: Any = None,
+        input: dict | list | str,
+        expected_output: dict | list | str | None = None,
         metadata: dict | None = None,
         source_trace_id: str = "",
         source_observation_id: str = "",
@@ -510,7 +530,7 @@ def _write_tools(client: LangfuseClient) -> list:
         try:
             if create_dataset:
                 try:
-                    client.get(f"/api/public/v2/datasets/{dataset_name}")
+                    client.get(f"/api/public/v2/datasets/{seg(dataset_name)}")
                 except LangfuseError as exc:
                     if "404" not in str(exc):
                         raise

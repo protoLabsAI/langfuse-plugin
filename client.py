@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote, unquote
 
 import httpx
 
@@ -28,6 +31,31 @@ DEFAULT_TIMEOUT_S = 20.0
 
 class LangfuseError(Exception):
     """A request that could not be completed. The message is safe to show the model."""
+
+
+def seg(value: Any) -> str:
+    """One URL path segment: every reserved character encoded, so an id or name can't add
+    segments, a query or a fragment (``folder/prompt`` -> ``folder%2Fprompt``)."""
+    return quote(str(value), safe="")
+
+
+def _check_path(path: str) -> None:
+    """Refuse anything but a plain ``/api/public/...`` path. The prefix check alone isn't
+    enough: the HTTP client collapses ``..`` segments AFTER it, so ``/api/public/../admin``
+    would reach ``/api/admin`` with the Basic auth header attached."""
+    if not path.startswith("/api/public/"):
+        raise LangfuseError(f"path must start with /api/public/ (got {path!r})")
+    decoded = path
+    for _ in range(3):  # %252e%252e -> %2e%2e -> ..
+        decoded = unquote(decoded)
+    parts = re.split(r"[/\\]", decoded)
+    if "?" in path or "#" in path or any(part in (".", "..") for part in parts):
+        raise LangfuseError(f"path must be a plain /api/public/ path with no '..', query or fragment (got {path!r})")
+
+
+def _display(host: str) -> str:
+    """A host safe to put in an error message (no userinfo)."""
+    return re.sub(r"//[^/@]*@", "//", host)
 
 
 @dataclass(frozen=True)
@@ -94,7 +122,15 @@ class LangfuseClient:
         self._transport = transport  # tests inject a MockTransport
 
     def credentials(self) -> Credentials:
-        return resolve_credentials(self._cfg, self._host_config)
+        """Resolved at call time, cached briefly: a tool call resolves more than once, and
+        the host resolver may log on every call."""
+        now = time.monotonic()
+        cached = getattr(self, "_creds", None)
+        if cached is not None and now - cached[0] < 30:
+            return cached[1]
+        creds = resolve_credentials(self._cfg, self._host_config)
+        self._creds = (now, creds)
+        return creds
 
     def request(
         self,
@@ -104,8 +140,7 @@ class LangfuseClient:
         params: dict | None = None,
         body: Any = None,
     ) -> Any:
-        if not path.startswith("/api/public/"):
-            raise LangfuseError(f"path must start with /api/public/ (got {path!r})")
+        _check_path(path)
         creds = self.credentials()
         clean_params = {k: v for k, v in (params or {}).items() if v not in (None, "", [])}
         try:
@@ -124,7 +159,7 @@ class LangfuseClient:
             ) as http:
                 resp = http.request(method.upper(), path, params=clean_params, json=body)
         except httpx.HTTPError as exc:
-            raise LangfuseError(f"could not reach Langfuse at {creds.host}: {type(exc).__name__}: {exc}") from exc
+            raise LangfuseError(f"could not reach Langfuse at {_display(creds.host)}: {type(exc).__name__}") from exc
         if resp.status_code == 401:
             raise LangfuseError(f"Langfuse rejected the credentials (401) from source {creds.source!r}")
         if resp.status_code >= 400:

@@ -63,6 +63,14 @@ Reading traces is safe, so the read tools are always on. Writing to the project 
 dataset items, prompt or config changes through `langfuse_api`) is an operator decision,
 so it stays off until `allow_writes` is set.
 
+## Langfuse versions
+
+The read tools use the public read API of Langfuse v3 write-mode deployments (self-hosted
+3.x, and Langfuse Cloud until its v3 read endpoints are removed on 2026-11-16).
+`langfuse_scores` already prefers the v4-safe `/v3/scores`. Support for the v4 read APIs
+(`/v2/observations`, `/v2/metrics`) is tracked in
+[#2](https://github.com/protoLabsAI/langfuse-plugin/issues/2).
+
 ## Updating the vendored skill
 
 ```bash

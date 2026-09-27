@@ -52,3 +52,11 @@ def test_register_contributes_the_tools_and_the_skill_dir(registry_cls):
     reg = registry_cls(config=CFG)
     langfuse_plugin.register(reg)
     assert len(reg.tools) == len(build_tools(CFG)) and reg.skill_dirs == ["skills"]
+
+
+def test_compose_fails_loudly_if_upstream_rewords_the_cli_principle():
+    import pytest
+
+    upstream = (ROOT / "vendor/langfuse/SKILL.md").read_text("utf-8").replace("CLI for Data Access", "Data via CLI")
+    with pytest.raises(ValueError, match="principle 2"):
+        sync.compose(upstream)
