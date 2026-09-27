@@ -1,0 +1,35 @@
+# protoagent.plugin.yaml — the plugin manifest. DATA ONLY: the host reads this
+# without importing the plugin's code.
+id: langfuse
+name: Langfuse (traces, prompts, datasets, evals)
+version: 0.1.0
+description: >-
+  Langfuse's official agent skill (github.com/langfuse/skills, MIT) plus native tools
+  for Langfuse data: list and inspect traces (with an observation tree that flags
+  orphaned spans), observations, sessions, scores, prompts, datasets and daily
+  metrics, read the live Langfuse docs, and call any public API endpoint. Uses the
+  agent's own tracing credentials by default, so an agent that already traces to
+  Langfuse needs no extra setup. Write tools (scores, dataset items, non-GET API
+  calls) are off until allow_writes is set.
+enabled: false
+repository: https://github.com/protoLabsAI/langfuse-plugin
+min_protoagent_version: "0.148.0"
+
+config_section: langfuse
+config:
+  # Leave all three empty to use this agent's tracing credentials (tracing.* +
+  # secrets.yaml), or the LANGFUSE_* environment.
+  public_key: ""
+  secret_key: ""
+  host: ""
+  # Registers langfuse_score / langfuse_dataset_item and allows non-GET langfuse_api
+  # calls. Off by default: reading traces is safe; writing to the project is a choice.
+  allow_writes: false
+  # Cap on each input/output value a tool returns, in characters.
+  max_io_chars: 1500
+  timeout_s: 20
+secrets: [secret_key]
+
+capabilities:
+  network: ["*"]               # langfuse.com (docs) + your configured Langfuse host
+  filesystem: none

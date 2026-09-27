@@ -1,0 +1,21 @@
+name: Release
+
+# Cuts a tagged GitHub release (LLM-themed notes + Discord embed) through the org's
+# reusable plugin-release workflow, which reads the version from protoagent.plugin.yaml.
+# Fires on a `chore: release vX.Y.Z` squash subject on main, or `gh workflow run Release`.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: >-
+      github.repository == 'protoLabsAI/langfuse-plugin' &&
+      (github.event_name == 'workflow_dispatch' ||
+       startsWith(github.event.head_commit.message, 'chore: release v'))
+    uses: protoLabsAI/release-tools/.github/workflows/plugin-release.yml@v2
+    secrets: inherit
