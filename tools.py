@@ -92,7 +92,7 @@ def _observation_line(o: dict) -> str:
     total = usage.get("total") if isinstance(usage, dict) else None
     if total:
         bits.append(f"tokens={total}")
-    cost = o.get("calculatedTotalCost") or (o.get("costDetails") or {}).get("total")
+    cost = o.get("calculatedTotalCost") or o.get("totalCost") or (o.get("costDetails") or {}).get("total")
     if cost:
         bits.append(f"cost=${cost:.4f}" if isinstance(cost, (int, float)) else f"cost={cost}")
     if o.get("statusMessage"):
@@ -167,6 +167,105 @@ def _trace_from_observations(client: LangfuseClient, trace_id: str, max_nodes: i
     }
 
 
+_V2_OBSERVATIONS = "/api/public/v2/observations"
+_V2_METRICS = "/api/public/v2/metrics"
+_V2_PAGE = 1000  # the v2 endpoints' hard per-request ceiling
+
+
+def _v2_unavailable(exc: Exception) -> bool:
+    """True when the server does not serve a v2 read: before Langfuse v4 (or while it is
+    still in ``legacy`` write mode) it answers 404 "only available in a Langfuse v4 write
+    mode". Callers then fall back to the v1 endpoint. Any other failure is real."""
+    return isinstance(exc, LangfuseError) and "returned 404" in str(exc)
+
+
+def _flt(column: str, value: Any, kind: str = "string", operator: str = "=") -> dict:
+    return {"type": kind, "column": column, "operator": operator, "value": value}
+
+
+_ROOT = _flt("isRootObservation", True, "boolean")
+
+
+def _v2_observations(client: LangfuseClient, *, fields: str, limit: int, cursor: str = "", filters=None, **params):
+    """One page of ``/v2/observations``: ``(rows, next_cursor)``. ``fields`` names the field
+    groups to return (core, basic, time, io, model, usage, ...); v2 returns only what is asked."""
+    data = client.get(
+        _V2_OBSERVATIONS,
+        fields=fields,
+        limit=_limit(limit, 100, ceiling=_V2_PAGE),
+        cursor=cursor,
+        filter=json.dumps(filters) if filters else None,
+        **params,
+    )
+    return data.get("data") or [], (data.get("meta") or {}).get("cursor")
+
+
+def _v2_metrics(client: LangfuseClient, query: dict) -> list[dict]:
+    return client.get(_V2_METRICS, query=json.dumps(query)).get("data") or []
+
+
+def _root_as_trace(o: dict) -> dict:
+    """A root observation read as the trace summary it stands for. Per-trace totals (cost,
+    tag set) are not on the observation, so they are left out rather than guessed."""
+    return {
+        "id": o.get("traceId"),
+        "name": o.get("name"),
+        "timestamp": o.get("startTime"),
+        "sessionId": o.get("sessionId"),
+        "userId": o.get("userId"),
+        "latency": o.get("latency"),
+        "input": o.get("input"),
+        "output": o.get("output"),
+        "_project": o.get("projectId"),
+    }
+
+
+def _fetch_scores(client: LangfuseClient, **params) -> dict:
+    """Scores, newest endpoint first: v3 survives Langfuse v4; v2 and v1 serve older servers."""
+    for path in ("/api/public/v3/scores", "/api/public/v2/scores", "/api/public/scores"):
+        try:
+            return client.get(path, **params)
+        except LangfuseError as exc:
+            if "404" not in str(exc) or path == "/api/public/scores":
+                raise
+    return {}
+
+
+def _trace_v2(client: LangfuseClient, trace_id: str, max_nodes: int, include_io: bool) -> dict:
+    """A trace rebuilt from its observations (Langfuse v4 has no trace read): the tree from
+    every observation with the trace id, the summary from the root, scores from /v3/scores."""
+    observations: list[dict] = []
+    cursor = ""
+    while len(observations) < max_nodes:
+        rows, cursor = _v2_observations(
+            client,
+            fields="core,basic,time,model,usage",
+            limit=min(_V2_PAGE, max_nodes - len(observations)),
+            cursor=cursor,
+            traceId=trace_id,
+        )
+        observations += rows
+        if not rows or not cursor:
+            break
+    if not observations:
+        raise LangfuseError(f"no observations found for trace {trace_id!r} (unknown id, or not ingested yet)")
+    roots = [o for o in observations if not o.get("parentObservationId")]
+    root = min(roots, key=lambda o: o.get("startTime") or "") if roots else {}
+    trace = {**_root_as_trace(root), "id": trace_id, "observations": observations, "scores": []}
+    if include_io and root:
+        # Root IO only: asking for io on every observation would page the whole trace's payload.
+        rows, _ = _v2_observations(
+            client, fields="core,io", limit=1, traceId=trace_id, filters=[_ROOT, _flt("id", root.get("id"))]
+        )
+        if rows:
+            trace["input"], trace["output"] = rows[0].get("input"), rows[0].get("output")
+    try:
+        trace["scores"] = _fetch_scores(client, traceId=trace_id, limit=100).get("data") or []
+    except LangfuseError as exc:
+        trace["note"] = f"scores unavailable: {exc}"
+    return trace
+
+
 def _search_results(payload: dict) -> list[dict]:
     """Normalise a ``/api/search-docs`` reply. ``answer`` is a JSON string holding either a
     list of documents (the shape the skill documents) or ``{"content": [documents]}`` (the
@@ -182,6 +281,121 @@ def _search_results(payload: dict) -> list[dict]:
         text = " … ".join(c.get("text", "") if isinstance(c, dict) else str(c) for c in chunks)
         results.append({"title": d.get("title"), "url": d.get("url"), "excerpt": _cap(text, 600)})
     return results
+
+
+def _observation_row(o: dict, include_io: bool, io_chars: int) -> dict:
+    row = {
+        "line": _observation_line(o),
+        "traceId": o.get("traceId"),
+        "startTime": o.get("startTime"),
+        "parentObservationId": o.get("parentObservationId"),
+    }
+    if include_io:
+        row["input"] = _cap(o.get("input"), io_chars)
+        row["output"] = _cap(o.get("output"), io_chars)
+    return row
+
+
+def _traces_v2(
+    client, base, io_chars, limit, name, session_id, user_id, tags, since_hours, order_by, environment, cursor
+):
+    """Traces listed as their root observations: on Langfuse v4 a trace is just the
+    observation with no parent, and the filters apply to it."""
+    filters = [_ROOT]
+    for column, value in (("name", name), ("sessionId", session_id), ("userId", user_id), ("environment", environment)):
+        if value:
+            filters.append(_flt(column, value))
+    if tags:
+        filters.append(_flt("tags", tags, "arrayOptions", "all of"))
+    rows, next_cursor = _v2_observations(
+        client,
+        fields="core,basic,time,io",
+        limit=_limit(limit, 20),
+        cursor=cursor,
+        filters=filters,
+        fromStartTime=_since(since_hours),
+    )
+    traces = []
+    for o in rows:
+        trace = _root_as_trace(o)
+        project = trace.pop("_project", None)
+        summary = _trace_summary(trace, io_chars, base)
+        if project and trace.get("id"):
+            summary["url"] = f"{base}/project/{project}/traces/{trace['id']}"
+        traces.append(summary)
+    out = {"traces": traces, "next_cursor": next_cursor}
+    if order_by:
+        out["note"] = "order_by is ignored on Langfuse v4: traces are listed newest first"
+    return out
+
+
+def _sessions_v2(client, base, io_chars, session_id, limit, since_hours):
+    if session_id:
+        rows, _ = _v2_observations(
+            client, fields="core,basic,time,io", limit=100, filters=[_ROOT, _flt("sessionId", session_id)]
+        )
+        traces = sorted((_root_as_trace(o) for o in rows), key=lambda t: t.get("timestamp") or "")
+        for t in traces:
+            t.pop("_project", None)
+        return {"id": session_id, "traces": [_trace_summary(t, io_chars, base) for t in traces]}
+    now = dt.datetime.now(dt.UTC)
+    start = now - dt.timedelta(hours=float(since_hours or 24 * 7))
+    rows = _v2_metrics(
+        client,
+        {
+            "view": "observations",
+            "metrics": [{"measure": "count", "aggregation": "count"}],
+            "dimensions": [{"field": "sessionId"}],
+            "fromTimestamp": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "toTimestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "orderBy": [{"field": "count_count", "direction": "desc"}],
+            "config": {"row_limit": _limit(limit, 20)},
+        },
+    )
+    sessions = [{"id": r["sessionId"], "observations": r.get("count_count")} for r in rows if r.get("sessionId")]
+    return {
+        "sessions": sessions,
+        "note": "Langfuse v4: busiest sessions in the window; no created-at time is available",
+    }
+
+
+def _metrics_v2(client, days, trace_name, user_id, tags):
+    span = _limit(days, 7, ceiling=90)
+    now = dt.datetime.now(dt.UTC)
+    filters = []
+    if trace_name:
+        filters.append(_flt("traceName", trace_name))
+    if user_id:
+        filters.append(_flt("userId", user_id))
+    if tags:
+        filters.append(_flt("tags", tags, "arrayOptions", "all of"))
+    rows = _v2_metrics(
+        client,
+        {
+            "view": "observations",
+            "metrics": [
+                {"measure": "count", "aggregation": "count"},
+                {"measure": "totalCost", "aggregation": "sum"},
+                {"measure": "totalTokens", "aggregation": "sum"},
+            ],
+            "dimensions": [{"field": "providedModelName"}],
+            "timeDimension": {"granularity": "day"},
+            "filters": filters,
+            "fromTimestamp": (now - dt.timedelta(days=span)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "toTimestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        },
+    )
+    return [
+        {
+            "date": r.get("time_dimension"),
+            "model": r.get("providedModelName"),
+            "observations": r.get("count_count"),
+            "cost_usd": r.get("sum_totalCost"),
+            "tokens": r.get("sum_totalTokens"),
+        }
+        for r in rows
+        if r.get("count_count")
+    ]
 
 
 def build_tools(
@@ -205,14 +419,37 @@ def build_tools(
         since_hours: float = 0,
         order_by: str = "",
         environment: str = "",
+        cursor: str = "",
     ) -> str:
         """List recent Langfuse traces (newest first), with capped input/output and a UI link.
 
         Filter by trace name, session_id, user_id, tags (all must match), environment, or a
         time window (since_hours). order_by is "<field>.<asc|desc>", e.g. "latency.desc" or
-        "totalCost.desc". Use langfuse_trace for one trace's full observation tree.
+        "totalCost.desc" (honoured only by Langfuse v3 servers; v4 lists newest first). On
+        Langfuse v4 the list comes back with a next_cursor: pass it as cursor for the next
+        page. Use langfuse_trace for one trace's full observation tree.
         """
         try:
+            try:
+                return _dump(
+                    _traces_v2(
+                        client,
+                        host(),
+                        io_chars,
+                        limit,
+                        name,
+                        session_id,
+                        user_id,
+                        tags,
+                        since_hours,
+                        order_by,
+                        environment,
+                        cursor,
+                    )
+                )
+            except LangfuseError as exc:
+                if not _v2_unavailable(exc):
+                    raise
             data = client.get(
                 "/api/public/traces",
                 limit=_limit(limit, 20),
@@ -243,14 +480,20 @@ def build_tools(
         was never exported, or a run still in flight (a span is exported when it ends).
         """
         try:
+            nodes = _limit(max_observations, 150, ceiling=1000)
             try:
-                t = client.get(f"/api/public/traces/{seg(trace_id)}")
+                t = _trace_v2(client, trace_id, nodes, include_io)
             except LangfuseError as exc:
-                if "422" not in str(exc):
+                if not _v2_unavailable(exc):
                     raise
-                # The legacy trace endpoint can keep timing out on a big trace; the
-                # observations endpoint pages the same tree without the heavy join.
-                t = _trace_from_observations(client, trace_id, _limit(max_observations, 150, ceiling=1000))
+                try:
+                    t = client.get(f"/api/public/traces/{seg(trace_id)}")
+                except LangfuseError as legacy_exc:
+                    if "422" not in str(legacy_exc):
+                        raise
+                    # The legacy trace endpoint can keep timing out on a big trace; the
+                    # observations endpoint pages the same tree without the heavy join.
+                    t = _trace_from_observations(client, trace_id, nodes)
             summary = _trace_summary(t, io_chars if include_io else 0, host())
             if not include_io:
                 summary.pop("input", None)
@@ -275,14 +518,37 @@ def build_tools(
         since_hours: float = 0,
         limit: int = 30,
         include_io: bool = False,
+        cursor: str = "",
     ) -> str:
         """List Langfuse observations across traces — e.g. every GENERATION for a model call
         name, every TOOL span named "tool:web_search", or all observations of one trace.
 
         type is SPAN | GENERATION | EVENT | AGENT | TOOL | CHAIN | RETRIEVER | EMBEDDING.
-        IO is omitted unless include_io is true (then capped).
+        IO is omitted unless include_io is true (then capped). On Langfuse v4 the reply has a
+        next_cursor (and no total): pass it as cursor for the next page.
         """
         try:
+            try:
+                rows, next_cursor = _v2_observations(
+                    client,
+                    fields="core,basic,time,model,usage" + (",io" if include_io else ""),
+                    limit=limit,
+                    cursor=cursor,
+                    traceId=trace_id,
+                    type=type.upper() if type else "",
+                    name=name,
+                    userId=user_id,
+                    fromStartTime=_since(since_hours),
+                )
+                return _dump(
+                    {
+                        "observations": [_observation_row(o, include_io, io_chars) for o in rows],
+                        "next_cursor": next_cursor,
+                    }
+                )
+            except LangfuseError as exc:
+                if not _v2_unavailable(exc):
+                    raise
             data = client.get(
                 "/api/public/observations",
                 traceId=trace_id,
@@ -292,18 +558,7 @@ def build_tools(
                 fromStartTime=_since(since_hours),
                 limit=_limit(limit, 30),
             )
-            rows = []
-            for o in data.get("data") or []:
-                row = {
-                    "line": _observation_line(o),
-                    "traceId": o.get("traceId"),
-                    "startTime": o.get("startTime"),
-                    "parentObservationId": o.get("parentObservationId"),
-                }
-                if include_io:
-                    row["input"] = _cap(o.get("input"), io_chars)
-                    row["output"] = _cap(o.get("output"), io_chars)
-                rows.append(row)
+            rows = [_observation_row(o, include_io, io_chars) for o in data.get("data") or []]
             return _dump({"total": (data.get("meta") or {}).get("totalItems"), "observations": rows})
         except Exception as exc:  # never raise into the turn
             return _error(exc)
@@ -313,6 +568,11 @@ def build_tools(
         """List Langfuse sessions (grouped conversations), or with session_id, get that
         session's traces in order with their capped input/output."""
         try:
+            try:
+                return _dump(_sessions_v2(client, host(), io_chars, session_id, limit, since_hours))
+            except LangfuseError as exc:
+                if not _v2_unavailable(exc):
+                    raise
             if session_id:
                 s = client.get(f"/api/public/sessions/{seg(session_id)}")
                 base = host()
@@ -348,15 +608,7 @@ def build_tools(
                 "fromTimestamp": _since(since_hours),
                 "limit": _limit(limit, 30),
             }
-            data = None
-            # v3 is the endpoint that survives Langfuse v4; v2 and v1 serve older servers.
-            for path in ("/api/public/v3/scores", "/api/public/v2/scores", "/api/public/scores"):
-                try:
-                    data = client.get(path, **params)
-                    break
-                except LangfuseError as exc:
-                    if "404" not in str(exc) or path == "/api/public/scores":
-                        raise
+            data = _fetch_scores(client, **params)
             keep = ("id", "traceId", "observationId", "name", "value", "stringValue", "dataType", "source", "comment")
             return _dump(
                 {
@@ -419,9 +671,15 @@ def build_tools(
 
     @tool
     def langfuse_metrics(days: int = 7, trace_name: str = "", user_id: str = "", tags: list[str] | None = None) -> str:
-        """Daily Langfuse usage: trace and observation counts, cost, and token usage per
-        model, for the last `days` days (optionally for one trace name, user or tag set)."""
+        """Daily Langfuse usage: observation counts, cost, and tokens per model, for the last
+        `days` days (optionally for one trace name, user or tag set). On Langfuse v4 each row
+        is one day x model; on v3 servers each row is one day with a per-model usage list."""
         try:
+            try:
+                return _dump({"days": _metrics_v2(client, days, trace_name, user_id, tags)})
+            except LangfuseError as exc:
+                if not _v2_unavailable(exc):
+                    raise
             data = client.get(
                 "/api/public/metrics/daily",
                 traceName=trace_name,
