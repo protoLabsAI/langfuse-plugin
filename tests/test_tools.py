@@ -171,7 +171,11 @@ def test_path_traversal_never_leaves_the_public_api(fake):
     # An id is encoded as ONE segment, and a decoded ".." inside it is still refused.
     out = json.loads(tools["langfuse_trace"].invoke({"trace_id": "../../admin/users"}))
     assert "'..'" in out["error"]
-    assert not fake.requests  # nothing left the process
+    # The v2 read carries the id as an encoded QUERY value, which cannot alter the path; the
+    # legacy fallback, which would put it in the path, refuses it. Nothing ever leaves the
+    # public API, and no request path contains a traversal.
+    assert all(r.url.path.startswith("/api/public/") and ".." not in r.url.path for r in fake.requests)
+    assert all(r.url.path != "/api/public/traces/../../admin/users" for r in fake.requests)
 
 
 def test_folder_prompt_names_are_encoded_as_one_segment(fake):
@@ -255,6 +259,8 @@ def test_a_legacy_query_timeout_is_retried(fake, monkeypatch):
     original = fake.handler
 
     def flaky(request):
+        if request.url.path != "/api/public/traces":
+            return original(request)  # the v2 probe (a 404 here) is not the call under test
         calls["n"] += 1
         if calls["n"] == 1:
             import httpx
@@ -300,3 +306,177 @@ def test_writes_are_never_replayed_on_a_timeout(fake, monkeypatch):
     fake.on("POST", "/api/public/scores", {"error": "Request timed out"}, status=422)
     _tools(fake, allow_writes=True)["langfuse_score"].invoke({"trace_id": "t", "name": "q", "value": 1})
     assert len([r for r in fake.requests if r.method == "POST"]) == 1
+
+
+# --- Langfuse v4: the v2 read endpoints ---------------------------------------------------
+
+
+def _root(trace_id="t1", **extra):
+    return {
+        "id": f"r-{trace_id}",
+        "traceId": trace_id,
+        "projectId": "gateway",
+        "type": "SPAN",
+        "name": "chat",
+        "startTime": "2026-10-22T05:00:00Z",
+        "latency": 1.5,
+        "isRootObservation": True,
+        **extra,
+    }
+
+
+def test_traces_on_v4_are_root_observations_with_filters_and_a_cursor(fake):
+    fake.on(
+        "GET",
+        "/api/public/v2/observations",
+        {"data": [_root(input="x" * 5000, output="ok", userId="u1")], "meta": {"cursor": "next-page"}},
+    )
+    out = json.loads(
+        _tools(fake, max_io_chars=100)["langfuse_traces"].invoke(
+            {"name": "chat", "user_id": "u1", "tags": ["a", "b"], "since_hours": 2, "order_by": "latency.desc"}
+        )
+    )
+
+    (t,) = out["traces"]
+    assert t["id"] == "t1" and t["name"] == "chat" and t["latency_s"] == 1.5
+    assert t["url"] == "https://lf.example/project/gateway/traces/t1"
+    assert t["input"].startswith("x" * 100) and "more chars" in t["input"]
+    assert out["next_cursor"] == "next-page" and "order_by is ignored" in out["note"]
+    params = dict(fake.requests[-1].url.params)
+    filters = json.loads(params["filter"])
+    assert {"type": "boolean", "column": "isRootObservation", "operator": "=", "value": True} in filters
+    assert {"type": "string", "column": "name", "operator": "=", "value": "chat"} in filters
+    assert {"type": "arrayOptions", "column": "tags", "operator": "all of", "value": ["a", "b"]} in filters
+    assert "fromStartTime" in params and [r.url.path for r in fake.requests] == ["/api/public/v2/observations"]
+
+
+def test_trace_on_v4_is_rebuilt_from_observations_with_scores(fake):
+    fake.on(
+        "GET",
+        "/api/public/v2/observations",
+        {
+            "data": [
+                _root(),
+                {
+                    "id": "g",
+                    "traceId": "t1",
+                    "type": "GENERATION",
+                    "name": "turn",
+                    "parentObservationId": "r-t1",
+                    "startTime": "2026-10-22T05:00:01Z",
+                    "model": "m",
+                    "totalCost": 0.0123,
+                },
+            ],
+            "meta": {},
+        },
+    )
+    fake.on("GET", "/api/public/v3/scores", {"data": [{"name": "helpful", "value": 1, "source": "API"}]})
+    out = json.loads(_tools(fake)["langfuse_trace"].invoke({"trace_id": "t1", "include_io": False}))
+
+    assert out["name"] == "chat" and out["roots"] == 1 and out["orphans"] == 0 and out["observations"] == 2
+    assert out["scores"] == [{"name": "helpful", "value": 1, "source": "API"}]
+    assert "cost=$0.0123" in out["tree"][1] and "model=m" in out["tree"][1]
+    first = dict(fake.requests[0].url.params)
+    assert first["traceId"] == "t1" and "io" not in first["fields"]
+    assert "/api/public/traces/t1" not in [r.url.path for r in fake.requests]
+
+
+def test_trace_on_v4_fetches_io_for_the_root_only(fake):
+    fake.on("GET", "/api/public/v2/observations", {"data": [_root(input="q", output="a")], "meta": {}})
+    fake.on("GET", "/api/public/v3/scores", {"data": []})
+    out = json.loads(_tools(fake)["langfuse_trace"].invoke({"trace_id": "t1"}))
+
+    assert out["input"] == "q" and out["output"] == "a"
+    io_call = [r for r in fake.requests if "io" in dict(r.url.params).get("fields", "")]
+    assert len(io_call) == 1 and dict(io_call[0].url.params)["limit"] == "1"
+
+
+def test_an_unknown_trace_on_v4_is_a_clear_error(fake):
+    fake.on("GET", "/api/public/v2/observations", {"data": [], "meta": {}})
+    out = json.loads(_tools(fake)["langfuse_trace"].invoke({"trace_id": "nope"}))
+    assert "no observations found" in out["error"]
+
+
+def test_observations_on_v4_page_by_cursor_and_skip_io_by_default(fake):
+    fake.on(
+        "GET",
+        "/api/public/v2/observations",
+        {
+            "data": [{"id": "o", "traceId": "t", "type": "TOOL", "name": "x", "input": "secret"}],
+            "meta": {"cursor": "c2"},
+        },
+    )
+    out = json.loads(_tools(fake)["langfuse_observations"].invoke({"type": "tool", "name": "x", "cursor": "c1"}))
+
+    assert out["next_cursor"] == "c2" and "input" not in out["observations"][0] and "total" not in out
+    params = dict(fake.requests[-1].url.params)
+    assert params["type"] == "TOOL" and params["cursor"] == "c1" and "io" not in params["fields"]
+    json.loads(_tools(fake)["langfuse_observations"].invoke({"include_io": True}))
+    assert "io" in dict(fake.requests[-1].url.params)["fields"]
+
+
+def test_a_server_not_in_v4_write_mode_falls_back_to_the_legacy_reads(fake):
+    for path in ("/api/public/v2/observations", "/api/public/v2/metrics"):
+        fake.on("GET", path, {"message": "only available in a Langfuse v4 write mode"}, status=404)
+    fake.on("GET", "/api/public/traces", {"data": [{"id": "t1", "name": "old"}], "meta": {"totalItems": 7}})
+    fake.on("GET", "/api/public/observations", {"data": [{"id": "o", "type": "SPAN"}], "meta": {"totalItems": 3}})
+    fake.on("GET", "/api/public/metrics/daily", {"data": [{"date": "2026-10-01"}]})
+    tools = _tools(fake)
+
+    assert json.loads(tools["langfuse_traces"].invoke({}))["total"] == 7
+    assert json.loads(tools["langfuse_observations"].invoke({}))["total"] == 3
+    assert json.loads(tools["langfuse_metrics"].invoke({}))["days"] == [{"date": "2026-10-01"}]
+
+
+def test_a_real_v2_failure_is_reported_not_papered_over_by_the_legacy_read(fake):
+    fake.on("GET", "/api/public/v2/observations", {"message": "boom"}, status=500)
+    fake.on("GET", "/api/public/traces", {"data": [{"id": "stale"}], "meta": {}})
+    out = json.loads(_tools(fake)["langfuse_traces"].invoke({}))
+    assert "500" in out["error"] and "traces" not in out
+
+
+def test_metrics_on_v4_are_a_flat_day_by_model_table(fake):
+    fake.on(
+        "GET",
+        "/api/public/v2/metrics",
+        {
+            "data": [
+                {"providedModelName": None, "time_dimension": "2026-10-20", "count_count": 0, "sum_totalCost": None},
+                {
+                    "providedModelName": "m",
+                    "time_dimension": "2026-10-21",
+                    "count_count": 52,
+                    "sum_totalCost": 0.5,
+                    "sum_totalTokens": 900,
+                },
+            ]
+        },
+    )
+    out = json.loads(_tools(fake)["langfuse_metrics"].invoke({"days": 3, "trace_name": "chat", "tags": ["a"]}))
+
+    assert out["days"] == [{"date": "2026-10-21", "model": "m", "observations": 52, "cost_usd": 0.5, "tokens": 900}]
+    query = json.loads(dict(fake.requests[-1].url.params)["query"])
+    assert query["view"] == "observations" and query["timeDimension"] == {"granularity": "day"}
+    assert {"type": "string", "column": "traceName", "operator": "=", "value": "chat"} in query["filters"]
+
+
+def test_sessions_on_v4_come_from_metrics_and_root_observations(fake):
+    fake.on(
+        "GET",
+        "/api/public/v2/metrics",
+        {"data": [{"sessionId": None, "count_count": 99}, {"sessionId": "s1", "count_count": 12}]},
+    )
+    fake.on(
+        "GET",
+        "/api/public/v2/observations",
+        {"data": [_root("t2", startTime="2026-10-22T06:00:00Z"), _root("t1")], "meta": {}},
+    )
+    tools = _tools(fake)
+
+    listed = json.loads(tools["langfuse_sessions"].invoke({}))
+    assert listed["sessions"] == [{"id": "s1", "observations": 12}]  # the null-session bucket is not a session
+    one = json.loads(tools["langfuse_sessions"].invoke({"session_id": "s1"}))
+    assert [t["id"] for t in one["traces"]] == ["t1", "t2"]  # oldest first
+    filters = json.loads(dict(fake.requests[-1].url.params)["filter"])
+    assert {"type": "string", "column": "sessionId", "operator": "=", "value": "s1"} in filters

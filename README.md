@@ -65,11 +65,25 @@ so it stays off until `allow_writes` is set.
 
 ## Langfuse versions
 
-The read tools use the public read API of Langfuse v3 write-mode deployments (self-hosted
-3.x, and Langfuse Cloud until its v3 read endpoints are removed on 2026-11-16).
-`langfuse_scores` already prefers the v4-safe `/v3/scores`. Support for the v4 read APIs
-(`/v2/observations`, `/v2/metrics`) is tracked in
-[#2](https://github.com/protoLabsAI/langfuse-plugin/issues/2).
+The read tools work against both generations of the API, per call:
+
+- **Langfuse v4** (self-hosted in `dual` or `events_only` write mode, and Langfuse Cloud): reads go
+  through `/v2/observations` and `/v2/metrics`, which survive the removal of the v3 read endpoints
+  (Cloud: 2026-11-16; self-hosted: at `events_only`). A trace is rebuilt from its observations: the
+  tree from every observation with the trace id, the summary from the root observation, scores from
+  `/v3/scores`. `langfuse_traces` lists root observations.
+- **Langfuse v3** (a server that answers a v2 read with `404`, e.g. "only available in a Langfuse v4
+  write mode"): the tool falls back to the v1 endpoints it used before. Any other failure from a v2
+  read is reported as an error, not retried against v1.
+
+What differs on v4:
+
+| Tool | v4 behaviour |
+|---|---|
+| `langfuse_traces`, `langfuse_observations` | Cursor paging: the reply has `next_cursor` (pass it back as `cursor`) and no `total`. `order_by` is ignored: newest first. Per-trace cost and the tag set are not on a root observation, so they are omitted. |
+| `langfuse_trace` | Same output. `include_io` reads the root's input/output with one extra call. |
+| `langfuse_sessions` | A list is the busiest sessions in the window (observation counts, no created-at time); one session is its root observations, oldest first. |
+| `langfuse_metrics` | Flat rows, one per day x model: `date`, `model`, `observations`, `cost_usd`, `tokens`. v3 servers return one row per day with a per-model usage list. |
 
 ## Updating the vendored skill
 
